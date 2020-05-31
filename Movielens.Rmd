@@ -1,0 +1,569 @@
+---
+title: "Movies Recommendation System"
+author: "Marcello Riderelli Belli"
+date: "22/5/2020"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+```
+
+## Introduction
+This work is using MovieLens 10M dataset:
+
+<https://grouplens.org/datasets/movielens/10m/>
+
+
+<http://files.grouplens.org/datasets/movielens/ml-10m.zip>
+
+The aim of this work is to build the basic structure of a movie recommendation system. We'll start from importing and exploring data, then we'll introduce the model and apply it to show the issues related to the high variability of sample sizes due to the fact that only blockbuster movies have a lot of ratings while the number of ratings by user is very very variable. This will lead us to introduce a tuning parameter in the model and apply cross validation to optimize its value.
+
+We'll reach the final result with a simple way to reduce the computation time which is one big issue with such the dimension of this data set.
+
+Now let's start.
+
+## Import
+The following code will import data in a data frame called "movielens" and save it in a file.
+
+Please use getwd() command to know your working directory and create in it "R" and "R/Data" subdirectories to use the code as is
+```{r import, eval=FALSE}
+if (sum(dir("~/R/Data/") == "ML10M.Rdata") == 0) {
+  
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::",
+                             "\t",
+                             readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId",
+                               "movieId",
+                               "rating",
+                               "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>%
+  mutate(movieId = as.numeric(levels(movieId))[movieId],
+         title = as.character(title),
+         genres = as.character(genres))
+
+movielens <- left_join(ratings,
+                       movies,
+                       by = "movieId")
+
+save(movielens, file="~/R/Data/ML10M.Rdata")
+
+}
+
+```
+
+## Tidy and Transform
+Now we can create edx set, which will be our training set, and validation set, our test set. Validation set will be 10% of MovieLens data
+```{r edx_temp}
+load(file = "~/R/Data/ML10M.RData")
+paste("How many NA in movielens?", sum(is.na(movielens)))
+options(digits=5)
+
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = movielens$rating,
+                                  times = 1,
+                                  p = 0.1,
+                                  list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+```
+
+Make sure userId and movieId in validation set are also in edx set
+```{r temp2validation}
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+```
+
+Add rows removed from validation set back into edx set
+```{r removed2edx}
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+```
+
+Finally let's clean Global Environment
+```{r clean}
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+## Explore 
+
+We have a huge training set
+```{r Q1}
+dim(edx)
+head(edx) %>% knitr::kable()
+```
+
+How many movies and users?
+``` {r Q3_Q4}
+data.frame(Movies = length(unique(edx$movieId)), Users = length(unique(edx$userId))) %>% knitr::kable()
+```
+
+Let's give a look at ratings by genres
+```{r Q5}
+edx %>%
+  group_by(genres) %>%
+  summarize(Num_Ratings = length(rating)) %>%
+  summarize(Drama = sum(Num_Ratings[str_detect(genres,"Drama")]),
+            Comedy = sum(Num_Ratings[str_detect(genres,"Comedy")]),
+            Thriller = sum(Num_Ratings[str_detect(genres,"Thriller")]),
+            Romance = sum(Num_Ratings[str_detect(genres,"Romance")])) %>%
+  knitr::kable()
+```
+
+Most rated movies
+``` {r Q6}
+edx %>%
+  group_by(movieId) %>%
+  summarize(Title = first(title),
+            Num_Ratings = length(rating)) %>%
+  arrange(desc(Num_Ratings)) %>%
+  slice(1:20) %>%
+  knitr::kable()
+```
+
+Most frequent ratings
+``` {r Q2_Q7}
+edx %>%
+  group_by(rating) %>%
+  summarize(Occurance = n()) %>%
+  arrange(desc(Occurance)) %>%
+  knitr::kable()
+``` 
+
+Full star ratings are more frequent than half star
+``` {r Q8}
+edx %>%
+  group_by(rating) %>%
+  summarize(Occurance = n()) %>%
+  arrange(desc(Occurance)) %>%
+  summarize(Full_Star = sum(Occurance[(rating - round(rating)) == 0]),
+            Half_Star = sum(Occurance[(rating - round(rating)) == 0.5])) %>%
+  knitr::kable()
+```
+
+## Model
+
+The model we use is linear, we start estimating the mean rating of all movies across all users, then considering that there are good movies and bad movies, we’ll add a movie effect term and finally considering that users can be more or less “friendly” when rating but also and especially that users typically tend to rate movies that they liked and to skip rating when not, we’ll add a user effect term.
+
+The complete model is
+
+$Y_{u,i} = \mu + b_{i} + b_{u} + \epsilon_{u,i}$
+
+where $\mu$ is calculated as average rating of all movies across all users, which is the least square estimate of $\mu$, that is the estimate that minimizes the root mean square error (RMSE)
+
+$b_{i}$ and $b_{u}$ will be calculated as the average rating of movie "i" and users "u" respectively
+
+Lets define our loss function: the root mean square error
+``` {r loss_function}
+RMSE <- function (true_ratings, predicted_ratings) {
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+  }
+```
+
+As said, in the most basic model, the average of all the ratings is used  as the estimate of $\mu$
+``` {r just_average}
+mu_hat <- mean(edx$rating)
+naive_rmse <- RMSE(validation$rating, mu_hat)
+
+rmse_results <- data_frame(Method = "Full Set - Just the average",
+                           RMSE = naive_rmse)
+
+rmse_results %>% knitr::kable()
+```
+
+Let's add that some movies are rated better or worse than others
+``` {r movie_effect}
+mu <- mean(edx$rating) 
+b_i <- 
+  edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+predicted_ratings <- validation %>% 
+  left_join(b_i, by='movieId') %>%
+  mutate(pred = mu + b_i) %>%
+  .$pred
+
+model_1_rmse <- RMSE(predicted_ratings, validation$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Method="Full Set - Movie Effect Model",
+                                     RMSE = model_1_rmse ))
+
+rmse_results %>% knitr::kable()
+```
+
+The following histogram shows the distribution and hence the variability respect to the average, of ratings by movie. We can see that the bigger portion of movies has ratings below the average. 
+``` {r bi_hist}
+b_i %>% qplot(b_i,
+              geom ="histogram",
+              bins = 30,
+              data = .,
+              color = I("black"))
+```
+
+Now let's give a look to the distribution of the average rating of each user
+``` {r user_effect}
+edx %>% 
+  group_by(userId) %>% 
+  summarize(user_avg_rating = mean(rating)) %>% 
+  ggplot(aes(user_avg_rating)) + 
+  geom_histogram(bins = 50, color = "black")
+```
+
+Probably users rate movies more frequently when they like it.
+
+Let's add the user effect
+``` {r add_user_effect}
+b_u <-
+  edx %>%
+  left_join(b_i, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+predicted_ratings <- validation %>% 
+  left_join(b_i, by='movieId') %>%
+  left_join(b_u, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+model_2_rmse <- RMSE(predicted_ratings, validation$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Method="Full Set - Movie & User Effects Model",  
+                                     RMSE = model_2_rmse ))
+rmse_results %>% knitr::kable()
+```
+
+Let's give a closer look at our model, we'll recommend movies with higher $b_{i}$
+So let's check which movies have the highest $b_{i}$ ...
+``` {r}
+movie_titles <- edx %>%
+  select(movieId, title) %>%
+  distinct()
+```
+
+Top 10 best movies
+``` {r bi_ranking_top}
+b_i %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b_i)) %>%
+  select(title, b_i) %>%
+  slice(1:10) %>%
+  knitr::kable()
+```
+
+... and which one will have the lowest $b_{i}$
+
+Top 10 worst movies
+``` {r bi_ranking_bottom}
+b_i %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(b_i) %>%
+  select(title, b_i) %>%
+  slice(1:10) %>%
+  knitr::kable()
+```
+
+There is something weird: we don't recognize any movie among the best or the worst.
+
+The point is, when calculating $b_{i}$ or $b_{u}$ we are grouping and averaging without considering the sample size, that is how many ratings the movie had or how many ratings the user did.
+
+How many ratings the best movies had?
+``` {r ratings_movie_top}
+edx %>%
+  count(movieId) %>%
+  left_join(b_i) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b_i)) %>%
+  select(title, b_i, n) %>%
+  slice(1:10) %>%
+  knitr::kable()
+```
+
+How many ratings the worst movies had?
+``` {r ratings_movie_bottom}
+edx %>%
+  count(movieId) %>%
+  left_join(b_i) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(b_i) %>%
+  select(title, b_i, n) %>%
+  slice(1:10) %>%
+  knitr::kable()
+```
+
+## Regularization
+
+First of all we need a more manageable dataset.
+Let's take ramdomly 300,000 samples from the edx set and create new training and test sets
+
+``` {r small_edx}
+edx_subset <- sample(1:nrow(edx), 300000, replace = FALSE)
+edx_1 <- edx[edx_subset, ]
+
+tst_idx <- createDataPartition(y = edx_1$rating,
+                               times = 1,
+                               p = 0.2,
+                               list = FALSE)
+trn_set <- edx_1[-tst_idx, ]
+tst_set <- edx_1[tst_idx, ]
+
+tst_set <- tst_set %>% 
+  semi_join(trn_set, by = "movieId") %>%
+  semi_join(trn_set, by = "userId")
+```
+
+
+Now we remake the calculations of the same methods above using the new small dataset
+``` {r small_models}
+mu_hat <- mean(trn_set$rating)
+naive_rmse <- RMSE(tst_set$rating, mu_hat)
+rmse_results <- data_frame(method = "Small Set - Just the average", RMSE = naive_rmse)
+
+# Movie Effect
+mu <- mean(trn_set$rating) 
+
+b_i <- trn_set %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+predicted_ratings <- mu + tst_set %>% 
+  left_join(b_i, by='movieId') %>%
+  .$b_i
+
+model_1_rmse <- RMSE(predicted_ratings, tst_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Small Set - Movie Effect Model",
+                                     RMSE = model_1_rmse ))
+
+# Movie and User effect
+b_u <- trn_set %>%
+  left_join(b_i, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+predicted_ratings <- tst_set %>% 
+  left_join(b_i, by='movieId') %>%
+  left_join(b_u, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+model_2_rmse <- RMSE(predicted_ratings, tst_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Small Set - Movie & User Effects Model",  
+                                     RMSE = model_2_rmse ))
+
+rmse_results %>% knitr::kable()
+```
+
+
+
+We have a more manageable dataset but not considering the number of rating yet, in fact ...
+``` {r}
+movie_titles <- edx_1 %>% 
+  select(movieId, title) %>%
+  distinct()
+```
+
+Top 10 best movies
+``` {r top10_small}
+edx_1 %>%
+  dplyr::count(movieId) %>% 
+  left_join(b_i) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b_i)) %>% 
+  select(title, b_i, n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+```
+
+Top 10 worst movies
+``` {r bottom10_small}
+edx_1 %>%
+  dplyr::count(movieId) %>% 
+  left_join(b_i) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(b_i) %>% 
+  select(title, b_i, n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+```
+
+We need to add a penalization term for small sample size when calculating the averages.
+Let's try a possible value for regularization, just to see how it works. Looking at the plot the action of the tuning parameter $\lambda$ is the shirinking of high estimates when the sample size is small
+``` {r reg_trial}
+lambda <- 3
+
+b_i_reg <- trn_set %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+lambda), n_i = n()) 
+
+data_frame(Original = b_i$b_i, 
+           Regularlized = b_i_reg$b_i, 
+           n = b_i_reg$n_i) %>%
+  ggplot(aes(Original, Regularlized, size=sqrt(n))) + 
+  geom_point(shape=1, alpha=0.5)
+```
+
+
+Now we give a look to the ranking after this non optimal regularization. It's just a trial.
+
+Top 10 best movies after regularization
+```{r top10_small_reg}
+trn_set %>%
+  dplyr::count(movieId) %>% 
+  left_join(b_i_reg) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b_i)) %>% 
+  select(title, b_i, n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+```
+
+Top 10 worst movies after regularization
+``` {r bottom10_small_reg}
+trn_set %>%
+  dplyr::count(movieId) %>% 
+  left_join(b_i_reg) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(b_i) %>% 
+  select(title, b_i, n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+```
+
+Let's apply the movie effect to the small dataset after regularization
+``` {r movie_small_reg}
+predicted_ratings <- tst_set %>% 
+  left_join(b_i_reg, by='movieId') %>%
+  mutate(pred = mu + b_i) %>%
+  .$pred
+
+model_3_rmse <- RMSE(predicted_ratings, tst_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Small Set - Regularized Movie Effect Model",  
+                                     RMSE = model_3_rmse ))
+rmse_results %>% knitr::kable()
+```
+
+It works but the trial value is probably not optimal so let's use cross validation to choose a better $\lambda$. The use of a small dataset is really good to reduce the computation time
+``` {r cross_validation_small}
+lambdas <- seq(0, 10, 0.25)
+mu <- mean(trn_set$rating)
+
+reg_fun <- function(l) {
+  
+  b_i <- trn_set %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  
+  b_u <- trn_set %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  predicted_ratings <- 
+    tst_set %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    .$pred
+  
+  return(RMSE(predicted_ratings, tst_set$rating)) 
+}
+
+rmses <- sapply(lambdas, reg_fun)
+```
+
+Let's see if there is a clear minimum
+``` {r cross_validation_small_plot}
+qplot(lambdas, rmses)  
+
+lambda <- lambdas[which.min(rmses)]
+lambda
+```
+
+yes there is and the updated table of results is
+
+``` {r}
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Small Set - Regularized Movie & User Effect Model",  
+                                     RMSE = min(rmses)))
+rmse_results %>% knitr::kable()
+```
+
+We finally apply the same value of $\lambda$ but we use the full dataset
+
+``` {r movie_user_full_reg}
+mu <- mean(edx$rating)
+
+b_i_reg <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu)/(n()+lambda))
+
+b_u_reg <- edx %>% 
+  left_join(b_i_reg, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - b_i - mu)/(n()+lambda))
+
+predicted_ratings <- 
+  validation %>% 
+  left_join(b_i_reg, by = "movieId") %>%
+  left_join(b_u_reg, by = "userId") %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+model_4_rmse <- RMSE(predicted_ratings, validation$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Full Set - Regularized Movie & User Effect Model",  
+                                     RMSE = model_4_rmse ))
+rmse_results %>% knitr::kable()
+```
+
+Let's finally check what are the best and worst movies
+
+``` {r full_ranking_reg}
+movie_titles <- edx %>% 
+  select(movieId, title) %>%
+  distinct()
+```
+
+Top 10 best movies after regularization
+``` {r top10_final_ranking}
+edx %>%
+  dplyr::count(movieId) %>% 
+  left_join(b_i_reg) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(desc(b_i)) %>% 
+  select(title, b_i, n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+```
+
+Top 10 worst movies after regularization
+``` {r bottom10_final_ranking}
+edx %>%
+  dplyr::count(movieId) %>% 
+  left_join(b_i_reg) %>%
+  left_join(movie_titles, by="movieId") %>%
+  arrange(b_i) %>% 
+  select(title, b_i, n) %>% 
+  slice(1:10) %>% 
+  knitr::kable()
+```
+
+The final RMSE is below the target (0.86490) and the movie ranking now makes sense and is consistent with all the considerations made along the report.
+
+
